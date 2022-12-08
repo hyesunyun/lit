@@ -1,14 +1,18 @@
 {
   "name": "lit-client",
-  "version": "0.0.1",
+  "version": "0.5.0",
   "description": "Client app for the Language Interpretability Tool (LIT)",
+  "engines": {
+    "node": ">=10.0.0"
+  },
   "scripts": {
     "clean": "rm -rf ./client/build",
+    "lint": "eslint -c ./.eslint.json 'client/**/*.ts'",
     "build": "yarn clean && webpack --env.production --config ./client/webpack/config.js",
     "watch": "yarn clean && webpack --config ./client/webpack/config.js --watch"
   },
   "author": "",
-  "license": "Apache 2",
+  "license": "Apache-2.0",
   "dependencies": {
     "@adobe/lit-mobx": "^2.0.0-rc.4",
     "@material/mwc-checkbox": "^0.15.0",
