@@ -7,7 +7,11 @@ functions to predict a batch of examples and extract information such as
 hidden states and attention.
 """
 import re
+import attr
+import gc
+import ast
 from typing import Dict, List, Tuple
+from statistics import mean
 
 from lit_nlp.api import model as lit_model
 from lit_nlp.api import types as lit_types
@@ -19,8 +23,39 @@ import tensorflow as tf
 import transformers
 import torch
 
-from bert_score import BERTScorer
+from evaluate import load
 
+bertscore = load("bertscore")
+
+JsonDict = lit_types.JsonDict
+
+def masked_token_mean_tf(vectors, masks):
+  """Mean over tokens.
+
+  Args:
+    vectors: <tf.float32>[batch_size, num_tokens, emb_dim]
+    masks: <tf.int32>[batch_size, num_tokens]
+
+  Returns:
+    <tf.float32>[batch_size, emb_dim]
+  """
+  masks = tf.cast(masks, tf.float32) 
+  weights = masks / tf.reduce_sum(masks, axis=1, keepdims=True)
+  return tf.reduce_sum(vectors * tf.expand_dims(weights, axis=-1), axis=1)
+
+def masked_token_mean_torch(vectors, masks):
+  """Mean over tokens.
+
+  Args:
+    vectors: <torch.float32>[batch_size, num_tokens, emb_dim]
+    masks: <torch.int32>[batch_size, num_tokens]
+
+  Returns:
+    <torch.float32>[batch_size, emb_dim]
+  """
+  masks = masks.type(torch.FloatTensor)
+  weights = masks / torch.sum(masks, axis=1)
+  return torch.sum(vectors * torch.unsqueeze(weights, -1), axis=1)
 
 class BertMLM(lit_model.Model):
   """BERT masked LM using Huggingface Transformers and TensorFlow 2."""
@@ -132,6 +167,18 @@ class BertMLM(lit_model.Model):
         "cls_emb": lit_types.Embeddings(),
     }
 
+@attr.s(auto_attribs=True, kw_only=True)
+class GPT2LanguageModelConfig(object):
+  """Config options for a GPT2 generation model."""
+  # Input options
+  inference_batch_size: int = 4
+  # Generation options
+  beam_size: int = 4
+  max_gen_length: int = 25
+  num_to_generate: int = 1
+  # Decoding options
+  token_top_k: int = 10
+  output_attention: bool = True
 
 class GPT2LanguageModel(lit_model.Model):
   """Wrapper for a Huggingface Transformers GPT-2 model.
@@ -153,6 +200,7 @@ class GPT2LanguageModel(lit_model.Model):
       top_k: How many predictions to prune.
     """
     super().__init__()
+    self.config = GPT2LanguageModelConfig(**config_kw)
     assert self.config.num_to_generate <= self.config.beam_size
     # GPT2 is trained without pad_token, so pick arbitrary one and mask out.
     self.tokenizer = transformers.AutoTokenizer.from_pretrained(
@@ -164,7 +212,7 @@ class GPT2LanguageModel(lit_model.Model):
     return self.tokenizer.batch_encode_plus(
         texts,
         return_tensors="tf",
-        add_special_tokens=True,
+        add_special_tokens=False,
         padding="longest",
         truncation="longest_first")
 
@@ -172,17 +220,12 @@ class GPT2LanguageModel(lit_model.Model):
     """Get predictions for a batch of tokenized examples.
     Each forward pass produces the following:
       logits: batch_size x dec_len x vocab_size
-      decoder_past_key_value_states: tuple with cached outputs.
+      past_key_values: tuple with cached outputs.
       dec_states: tuple[len:dec_layers]:
                   batch_size x dec_len x hid_size
       dec_attn: [optional] tuple[len:dec_layers+1]
                 batch_size x num_heads x dec_len x dec_len
-      enc_final_state: batch_size x enc_len x hid_size
-      enc_states: tuple[len:enc_layers]:
-                  batch_size x enc_len x hid_size
-      enc_attn: [optional] tuple[len:enc_layers+1]
-                batch_size x num_heads x enc_len x enc_len
-    The two optional attention fields are only returned if
+    The attention fields are only returned if
     config.output_attention is set.
     Args:
       encoded_inputs: Dict as returned from Tokenizer for inputs.
@@ -192,9 +235,10 @@ class GPT2LanguageModel(lit_model.Model):
     """
     results = self.model(
         input_ids=encoded_inputs["input_ids"],
-        decoder_input_ids=encoded_targets["input_ids"],
-        attention_mask=encoded_inputs["attention_mask"],
-        decoder_attention_mask=encoded_targets["attention_mask"])
+        # decoder_input_ids=encoded_targets["input_ids"],
+        attention_mask=encoded_inputs["attention_mask"]
+        # decoder_attention_mask=encoded_targets["attention_mask"]
+      )
 
     model_probs = tf.nn.softmax(results.logits, axis=-1)
     top_k = tf.math.top_k(
@@ -207,18 +251,15 @@ class GPT2LanguageModel(lit_model.Model):
         "top_k_indices": top_k.indices,
         "top_k_probs": top_k.values,
     }
-    # encoder_last_hidden_state is <float>[batch_size, num_tokens, emb_dim]
+    # hidden_states is <float>[batch_size, num_tokens, emb_dim]
     # take the mean over real tokens to get <float>[batch_size, emb_dim]
-    batched_outputs["encoder_final_embedding"] = masked_token_mean(
-        results.encoder_last_hidden_state, encoded_inputs["attention_mask"])
+    batched_outputs["decoder_final_embedding"] = masked_token_mean_tf(
+        results.hidden_states[0], encoded_inputs["attention_mask"])
 
     if self.config.output_attention:
-      for i in range(len(results.decoder_attentions)):
+      for i in range(len(results.attentions)):
         batched_outputs[
-            f"decoder_layer_{i+1:d}_attention"] = results.decoder_attentions[i]
-      for i in range(len(results.encoder_attentions)):
-        batched_outputs[
-            f"encoder_layer_{i+1:d}_attention"] = results.encoder_attentions[i]
+            f"decoder_layer_{i+1:d}_attention"] = results.attentions[i]
 
     return batched_outputs
 
@@ -270,8 +311,6 @@ class GPT2LanguageModel(lit_model.Model):
     for key in preds:
       if not re.match(r"\w+_layer_(\d+)/attention", key):
         continue
-      if key.startswith("encoder_"):
-        ntok = input_ntok
       elif key.startswith("decoder_"):
         ntok = target_ntok
       else:
@@ -283,7 +322,7 @@ class GPT2LanguageModel(lit_model.Model):
       # Make a copy of this array to avoid memory leaks, since NumPy otherwise
       # keeps a pointer around that prevents the source array from being GCed.
       preds[key] = preds[key].copy()
-
+    
     return preds
 
   ##
@@ -291,7 +330,7 @@ class GPT2LanguageModel(lit_model.Model):
   def max_minibatch_size(self) -> int:
     # The lit.Model base class handles batching automatically in the
     # implementation of predict(), and uses this value as the batch size.
-    return 6
+    return self.config.inference_batch_size
 
   def predict_minibatch(self, inputs):
     """Run model on a single batch.
@@ -306,17 +345,17 @@ class GPT2LanguageModel(lit_model.Model):
         [ex.get("target_text", "") for ex in inputs])
 
     ##
-    # Force-decode on target text, and also get encoder embs and attention.
+    # Force-decode on target text, and also get decoder embs and attention.
     batched_outputs = self._force_decode(encoded_inputs, encoded_targets)
     # Get the conditional generation from the model.
     # Workaround for output_hidden not being compatible with generate.
     # See https://github.com/huggingface/transformers/issues/8361
-    self.model.config.output_hidden_states = False
+    self.model.config.output_hidden_states = True
     generated_ids = self.model.generate(
         encoded_inputs.input_ids,
         num_beams=self.config.beam_size,
         attention_mask=encoded_inputs.attention_mask,
-        max_length=self.config.max_gen_length,
+        max_new_tokens=self.config.max_gen_length,
         num_return_sequences=self.config.num_to_generate)
     # [batch_size*num_return_sequences, num_steps]
     # -> [batch_size, num_return_sequences, num_steps]
@@ -332,16 +371,13 @@ class GPT2LanguageModel(lit_model.Model):
     return list(map(self._postprocess, unbatched_outputs))
 
   def input_spec(self):
-    return {
-        "input_text": lit_types.TextSegment(),
-        "target_text": lit_types.TextSegment(required=False),
-    }
+    return
 
   def output_spec(self):
     spec = {
         "output_text": lit_types.GeneratedText(parent="target_text"),
         "input_tokens": lit_types.Tokens(parent="input_text"),
-        "encoder_final_embedding": lit_types.Embeddings(),
+        "decoder_final_embedding": lit_types.Embeddings(),
         # If target text is given, the following will also be populated.
         "target_tokens": lit_types.Tokens(parent="target_text"),
         "pred_tokens": lit_types.TokenTopKPreds(align="target_tokens"),
@@ -353,11 +389,23 @@ class GPT2LanguageModel(lit_model.Model):
     if self.config.output_attention:
       # Add attention for each layer.
       for i in range(self.num_layers):
-        spec[f"encoder_layer_{i+1:d}_attention"] = lit_types.AttentionHeads(
-            align_in="input_tokens", align_out="input_tokens")
         spec[f"decoder_layer_{i+1:d}_attention"] = lit_types.AttentionHeads(
-            align_in="target_tokens", align_out="target_tokens")
+            align_in="input_tokens", align_out="input_tokens")
     return spec
+
+
+@attr.s(auto_attribs=True, kw_only=True)
+class BioGPTLanguageModelConfig(object):
+  """Config options for a BioGPT generation model."""
+  # Input options
+  inference_batch_size: int = 4
+  # Generation options
+  beam_size: int = 4
+  max_gen_length: int = 25
+  num_to_generate: int = 1
+  # Decoding options
+  token_top_k: int = 10
+  output_attention: bool = True
 
 class BioGPTLanguageModel(lit_model.Model):
   """Wrapper for a Huggingface Transformers BioGPTLanguageModel model.
@@ -371,7 +419,7 @@ class BioGPTLanguageModel(lit_model.Model):
   def num_layers(self):
     return self.model.config.num_hidden_layers
 
-  def __init__(self, model_name="microsoft/biogpt", top_k=10):
+  def __init__(self, model_name="microsoft/biogpt", **config_kw):
     """Constructor for BioGPTLanguageModel.
 
     Args:
@@ -379,18 +427,18 @@ class BioGPTLanguageModel(lit_model.Model):
       top_k: How many predictions to prune.
     """
     super().__init__()
+    self.config = BioGPTLanguageModelConfig(**config_kw)
     # GPT2-medium/BioGPT is trained without pad_token, so pick arbitrary one and mask out.
     self.tokenizer = transformers.AutoTokenizer.from_pretrained(
         model_name, pad_token="<|endoftext|>", use_fast=False)
     self.model = transformers.BioGptForCausalLM.from_pretrained(
         model_name, output_hidden_states=True, output_attentions=True)
-    self.top_k = top_k
 
   def _encode_texts(self, texts: List[str]):
     return self.tokenizer.batch_encode_plus(
         texts,
         return_tensors="pt",
-        add_special_tokens=True,
+        add_special_tokens=False,
         padding="longest",
         truncation="longest_first")
 
@@ -418,9 +466,10 @@ class BioGPTLanguageModel(lit_model.Model):
     """
     results = self.model(
         input_ids=encoded_inputs["input_ids"],
-        decoder_input_ids=encoded_targets["input_ids"],
-        attention_mask=encoded_inputs["attention_mask"],
-        decoder_attention_mask=encoded_targets["attention_mask"])
+        # decoder_input_ids=encoded_targets["input_ids"],
+        attention_mask=encoded_inputs["attention_mask"]
+        # decoder_attention_mask=encoded_targets["attention_mask"]
+      )
 
     model_probs = torch.softmax(results.logits, axis=-1, dtype=torch.float32)
     top_k = torch.topk(
@@ -433,18 +482,15 @@ class BioGPTLanguageModel(lit_model.Model):
         "top_k_indices": top_k.indices,
         "top_k_probs": top_k.values,
     }
-    # encoder_last_hidden_state is <float>[batch_size, num_tokens, emb_dim]
+    # hidden_states is <float>[batch_size, num_tokens, emb_dim]
     # take the mean over real tokens to get <float>[batch_size, emb_dim]
-    batched_outputs["encoder_final_embedding"] = masked_token_mean(
-        results.encoder_last_hidden_state, encoded_inputs["attention_mask"])
+    batched_outputs["decoder_final_embedding"] = masked_token_mean_torch(
+        results.hidden_states[0], encoded_inputs["attention_mask"])
 
     if self.config.output_attention:
-      for i in range(len(results.decoder_attentions)):
+      for i in range(len(results.attentions)):
         batched_outputs[
-            f"decoder_layer_{i+1:d}_attention"] = results.decoder_attentions[i]
-      for i in range(len(results.encoder_attentions)):
-        batched_outputs[
-            f"encoder_layer_{i+1:d}_attention"] = results.encoder_attentions[i]
+            f"decoder_layer_{i+1:d}_attention"] = results.attentions[i]
 
     return batched_outputs
 
@@ -496,8 +542,6 @@ class BioGPTLanguageModel(lit_model.Model):
     for key in preds:
       if not re.match(r"\w+_layer_(\d+)/attention", key):
         continue
-      if key.startswith("encoder_"):
-        ntok = input_ntok
       elif key.startswith("decoder_"):
         ntok = target_ntok
       else:
@@ -517,7 +561,7 @@ class BioGPTLanguageModel(lit_model.Model):
   def max_minibatch_size(self) -> int:
     # The lit.Model base class handles batching automatically in the
     # implementation of predict(), and uses this value as the batch size.
-    return 6
+    return self.config.inference_batch_size
 
   def predict_minibatch(self, inputs):
     """Run model on a single batch.
@@ -532,17 +576,17 @@ class BioGPTLanguageModel(lit_model.Model):
         [ex.get("target_text", "") for ex in inputs])
 
     ##
-    # Force-decode on target text, and also get encoder embs and attention.
+    # Force-decode on target text, and also get decoder embs and attention.
     batched_outputs = self._force_decode(encoded_inputs, encoded_targets)
     # Get the conditional generation from the model.
     # Workaround for output_hidden not being compatible with generate.
     # See https://github.com/huggingface/transformers/issues/8361
-    self.model.config.output_hidden_states = False
+    self.model.config.output_hidden_states = True
     generated_ids = self.model.generate(
         encoded_inputs.input_ids,
         num_beams=self.config.beam_size,
         attention_mask=encoded_inputs.attention_mask,
-        max_length=self.config.max_gen_length,
+        max_new_tokens=self.config.max_gen_length,
         num_return_sequences=self.config.num_to_generate)
     # [batch_size*num_return_sequences, num_steps]
     # -> [batch_size, num_return_sequences, num_steps]
@@ -553,22 +597,19 @@ class BioGPTLanguageModel(lit_model.Model):
     self.model.config.output_hidden_states = True
 
     # Convert to numpy for post-processing.
-    detached_outputs = {k: v.numpy() for k, v in batched_outputs.items()}
+    detached_outputs = {k: v.detach().numpy() for k, v in batched_outputs.items()}
     # Split up batched outputs, then post-process each example.
     unbatched_outputs = utils.unbatch_preds(detached_outputs)
     return list(map(self._postprocess, unbatched_outputs))
 
   def input_spec(self):
-    return {
-        "input_text": lit_types.TextSegment(),
-        "target_text": lit_types.TextSegment(required=False),
-    }
+    return
 
   def output_spec(self):
     spec = {
         "output_text": lit_types.GeneratedText(parent="target_text"),
         "input_tokens": lit_types.Tokens(parent="input_text"),
-        "encoder_final_embedding": lit_types.Embeddings(),
+        "decoder_final_embedding": lit_types.Embeddings(),
         # If target text is given, the following will also be populated.
         "target_tokens": lit_types.Tokens(parent="target_text"),
         "pred_tokens": lit_types.TokenTopKPreds(align="target_tokens"),
@@ -580,10 +621,8 @@ class BioGPTLanguageModel(lit_model.Model):
     if self.config.output_attention:
       # Add attention for each layer.
       for i in range(self.num_layers):
-        spec[f"encoder_layer_{i+1:d}_attention"] = lit_types.AttentionHeads(
-            align_in="input_tokens", align_out="input_tokens")
         spec[f"decoder_layer_{i+1:d}_attention"] = lit_types.AttentionHeads(
-            align_in="target_tokens", align_out="target_tokens")
+            align_in="input_tokens", align_out="input_tokens")
     return spec
 
 class SafeTextDecisionWrapper(lit_model.ModelWrapper):
@@ -596,16 +635,14 @@ class SafeTextDecisionWrapper(lit_model.ModelWrapper):
   }
 
   def __init__(self, model: lit_model.Model):
+    model.config.max_gen_length = 3
     super().__init__(model)
+    del model
+    torch.cuda.empty_cache()
+    gc.collect()
 
     # TODO(gehrmann): temp solution for BertScorer.
-    self._scorer = scorer = BERTScorer(lang="en", rescale_with_baseline=True)
-    # If output is List[(str, score)] instead of just str
-    self._multi_output = isinstance(self.output_spec()["output_text"],
-                                    lit_types.GeneratedTextCandidates)
-    self._get_pred_string = (
-        lit_types.GeneratedTextCandidates.top_text if self._multi_output else
-        (lambda x: x))
+    # self._scorer = BERTScorer(lang="en", rescale_with_baseline=True)
 
   def preprocess(self, ex: JsonDict) -> JsonDict:
     ret = {"input_text": ex["text"]}
@@ -634,10 +671,8 @@ class SafeTextDecisionWrapper(lit_model.ModelWrapper):
 
     # TODO(gehrmann): temp solution to get ROUGE scores in data table.
     for ex, mo in zip(inputs, outputs):
-      P, R, F1 = self._scorer.score(
-          self._get_pred_string(mo["output_text"],
-          ex["target"]))
-      mo["BERTScore"] = float(F1[0])
+      results = bertscore.compute(predictions=[mo["output_text"]], references=[ex["target"]], lang="en", model_type="distilbert-base-uncased", rescale_with_baseline=True, batch_size=1)
+      mo["BERTScore"] = float(results['f1'][0])
       yield mo
 
   def predict_with_metadata(self, indexed_inputs):
@@ -645,7 +680,11 @@ class SafeTextDecisionWrapper(lit_model.ModelWrapper):
     return self.predict((ex["data"] for ex in indexed_inputs))
 
   def input_spec(self):
-    return lit_types.remap_spec(self.wrapped.input_spec(), self.FIELD_RENAMES)
+    input_spec = {
+        "input_text": lit_types.TextSegment(),
+        "target_text": lit_types.TextSegment(),
+    }
+    return lit_types.remap_spec(input_spec, self.FIELD_RENAMES)
 
   def output_spec(self):
     spec = lit_types.remap_spec(self.wrapped.output_spec(), self.FIELD_RENAMES)
@@ -662,10 +701,12 @@ class SafeTextGenerationWrapper(lit_model.ModelWrapper):
   }
 
   def __init__(self, model: lit_model.Model):
+    model.config.max_gen_length = 25
     super().__init__(model)
+    del model
+    torch.cuda.empty_cache()
+    gc.collect()
 
-    # TODO(gehrmann): temp solution for BertScorer.
-    self._scorer = scorer = BERTScorer(lang="en", rescale_with_baseline=True)
     # If output is List[(str, score)] instead of just str
     self._multi_output = isinstance(self.output_spec()["output_text"],
                                     lit_types.GeneratedTextCandidates)
@@ -675,7 +716,7 @@ class SafeTextGenerationWrapper(lit_model.ModelWrapper):
 
   def preprocess(self, ex: JsonDict) -> JsonDict:
     ret = {"input_text": ex["text"]}
-    if "target" in ex:
+    if "safe_advices" in ex:
       ret["target_text"] = ex["safe_advices"]
     return ret
 
@@ -700,10 +741,13 @@ class SafeTextGenerationWrapper(lit_model.ModelWrapper):
 
     # TODO(gehrmann): temp solution to get ROUGE scores in data table.
     for ex, mo in zip(inputs, outputs):
-      P, R, F1 = self._scorer.score(
-          self._get_pred_string(mo["output_text"],
-          ex["safe_advices"]))
-      mo["BERTScore"] = float(F1[0])
+      prediction = self._get_pred_string(mo["output_text"])
+      references = ast.literal_eval(ex["safe_advices"])
+      f1_scores = []
+      for reference in references:
+        results = bertscore.compute(predictions=[prediction], references=[reference], lang="en", model_type="distilbert-base-uncased", rescale_with_baseline=True, batch_size=1)
+        f1_scores.append(results['f1'][0])
+      mo["BERTScore"] = float(mean(f1_scores))
       yield mo
 
   def predict_with_metadata(self, indexed_inputs):
@@ -711,7 +755,11 @@ class SafeTextGenerationWrapper(lit_model.ModelWrapper):
     return self.predict((ex["data"] for ex in indexed_inputs))
 
   def input_spec(self):
-    return lit_types.remap_spec(self.wrapped.input_spec(), self.FIELD_RENAMES)
+    input_spec = {
+        "input_text": lit_types.TextSegment(),
+        "target_text": lit_types.ReferenceTexts(),
+    }
+    return lit_types.remap_spec(input_spec, self.FIELD_RENAMES)
 
   def output_spec(self):
     spec = lit_types.remap_spec(self.wrapped.output_spec(), self.FIELD_RENAMES)

@@ -6,8 +6,8 @@ Currently supports the following model types:
 - BioGPT trained on biomedical text from GPT-2 medium
 
 To run locally:
-  python -m lit_nlp.examples.lm_demo \
-      --models=gpt2-medium --top_k 10 --port=5432 --max_examples=300 --alsologtostderr
+  python -m lit_nlp.examples.lm_safety_demo \
+      --models=gpt2-medium --top_k 10 --port=5432 --max_examples=50 --alsologtostderr
 
 Then navigate to localhost:5432 to access the demo UI.
 """
@@ -18,10 +18,12 @@ from absl import app
 from absl import flags
 from absl import logging
 
+from typing import Optional, Sequence
+
 from lit_nlp import dev_server
 from lit_nlp import server_flags
+from lit_nlp.api import layout
 from lit_nlp.api import dataset as lit_dataset
-from lit_nlp.api import dtypes as lit_dtypes
 from lit_nlp.components import word_replacer
 from lit_nlp.examples.datasets import lm
 from lit_nlp.examples.models import pretrained_lms
@@ -41,26 +43,27 @@ _MAX_EXAMPLES = flags.DEFINE_integer(
 )
 
 _NUM_TO_GEN = flags.DEFINE_integer(
-    "num_to_generate", 3, "Number of generations to produce for each input.")
+    "num_to_generate", 1, "Number of generations to produce for each input.")
 
 _TASKS = flags.DEFINE_list("tasks", ["decision", "generation"],
                            "Which task(s) to load.")
 
-# Custom frontend layout; see client/lib/types.ts
-LM_LAYOUT = lit_dtypes.LitComponentLayout(
-    components={
+# Custom frontend layout; see api/layout.py
+modules = layout.LitModuleName
+LM_LAYOUT = layout.LitCanonicalLayout(
+    upper={
         "Main": [
-            "embeddings-module",
-            "data-table-module",
-            "datapoint-editor-module",
-            "lit-slice-module",
-            "color-module",
-        ],
+            modules.EmbeddingsModule,
+            modules.DataTableModule,
+            modules.DatapointEditorModule,
+        ]
+    },
+    lower={
         "Predictions": [
-            "lm-prediction-module",
-            "confusion-matrix-module",
+            modules.LanguageModelPredictionModule,
+            modules.ConfusionMatrixModule,
         ],
-        "Counterfactuals": ["generator-module"],
+        "Counterfactuals": [modules.GeneratorModule],
     },
     description="Custom layout for language models.",
 )
@@ -93,20 +96,17 @@ def main(argv: Sequence[str]) -> Optional[dev_server.LitServerType]:
     model_name = os.path.basename(model_name_or_path)
     if model_name.startswith("gpt2"):
       base_models[model_name] = pretrained_lms.GPT2LanguageModel(
-          model_name_or_path, top_k=_TOKEN_TOP_K.value, num_to_generate=_NUM_TO_GEN.value)
+          model_name_or_path, token_top_k=_TOKEN_TOP_K.value, num_to_generate=_NUM_TO_GEN.value)
     elif model_name.startswith("biogpt"):
       base_models[model_name] = pretrained_lms.BioGPTLanguageModel(
-          model_name_or_path, top_k=_TOKEN_TOP_K.value, num_to_generate=_NUM_TO_GEN.value)
+          "microsoft/biogpt", token_top_k=_TOKEN_TOP_K.value, num_to_generate=_NUM_TO_GEN.value)
     else:
       raise ValueError(
           f"Unsupported model name '{model_name}' from path '{model_name_or_path}'"
       )
 
   models = {}
-  datasets = {
-    # Empty dataset, if you just want to type sentences into the UI.
-    "blank": lm.PlaintextSents("")
-  }
+  datasets = {}
 
   if "decision" in _TASKS.value:
     for k, m in base_models.items():
