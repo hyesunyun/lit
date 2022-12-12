@@ -9,6 +9,9 @@ To run locally:
   python -m lit_nlp.examples.lm_safety_demo \
       --models=gpt2-medium --top_k 10 --port=5432 --max_examples=50 --alsologtostderr
 
+To run using remote host:
+  python -m lit_nlp.examples.lm_safety_demo --top_k=10 --port=5432 --max_examples=100 --alsologtostderr --host=0.0.0.0
+
 Then navigate to localhost:5432 to access the demo UI.
 """
 import os

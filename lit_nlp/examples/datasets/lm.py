@@ -4,6 +4,8 @@ import glob
 from lit_nlp.api import dataset as lit_dataset
 from lit_nlp.api import types as lit_types
 
+import ast
+
 import pandas as pd
 
 import tensorflow_datasets as tfds
@@ -89,15 +91,18 @@ class SafeTextGenerationData(lit_dataset.Dataset):
 
     self._examples = []  # populate this with data records
     for _, row in df.iterrows():
-      self._examples.append({
-        "text": row["scenario"],
-        "safe_advices": row["safe"],
-        "unsafe_advices": row["unsafe"]
-      })
+      for x in ast.literal_eval(row["safe"]):
+        self._examples.append({
+          "text": row["scenario"],
+          "target": x,
+          "safe_advices": row["safe"],
+          "unsafe_advices": row["unsafe"]
+        })
 
   def spec(self) -> lit_types.Spec:
     return {
         "text": lit_types.TextSegment(),
+        "target": lit_types.TextSegment(),
         "safe_advices": lit_types.ReferenceTexts(),
         "unsafe_advices": lit_types.ReferenceTexts(),
     }

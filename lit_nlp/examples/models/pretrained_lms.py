@@ -175,7 +175,7 @@ class GPT2LanguageModelConfig(object):
   # Generation options
   beam_size: int = 4
   max_gen_length: int = 25
-  num_to_generate: int = 1
+  num_to_generate: int = 3
   # Decoding options
   token_top_k: int = 10
   output_attention: bool = True
@@ -402,7 +402,7 @@ class BioGPTLanguageModelConfig(object):
   # Generation options
   beam_size: int = 4
   max_gen_length: int = 25
-  num_to_generate: int = 1
+  num_to_generate: int = 3
   # Decoding options
   token_top_k: int = 10
   output_attention: bool = True
@@ -635,7 +635,7 @@ class SafeTextDecisionWrapper(lit_model.ModelWrapper):
   }
 
   def __init__(self, model: lit_model.Model):
-    model.config.max_gen_length = 3
+    model.config.max_gen_length = 10
     super().__init__(model)
     del model
     torch.cuda.empty_cache()
@@ -697,7 +697,7 @@ class SafeTextGenerationWrapper(lit_model.ModelWrapper):
   # Mapping from generic SafeText fields to this task
   FIELD_RENAMES = {
       "input_text": "text",
-      "target_text": "safe_advices",
+      "target_text": "target"
   }
 
   def __init__(self, model: lit_model.Model):
@@ -716,8 +716,8 @@ class SafeTextGenerationWrapper(lit_model.ModelWrapper):
 
   def preprocess(self, ex: JsonDict) -> JsonDict:
     ret = {"input_text": ex["text"]}
-    if "safe_advices" in ex:
-      ret["target_text"] = ex["safe_advices"]
+    if "target" in ex:
+      ret["target_text"] = ex["target"]
     return ret
 
   ##
@@ -742,12 +742,9 @@ class SafeTextGenerationWrapper(lit_model.ModelWrapper):
     # TODO(gehrmann): temp solution to get ROUGE scores in data table.
     for ex, mo in zip(inputs, outputs):
       prediction = self._get_pred_string(mo["output_text"])
-      references = ast.literal_eval(ex["safe_advices"])
-      f1_scores = []
-      for reference in references:
-        results = bertscore.compute(predictions=[prediction], references=[reference], lang="en", model_type="distilbert-base-uncased", rescale_with_baseline=True, batch_size=1)
-        f1_scores.append(results['f1'][0])
-      mo["BERTScore"] = float(mean(f1_scores))
+      results = bertscore.compute(predictions=[prediction], references=[ex["target"]], lang="en", model_type="distilbert-base-uncased", rescale_with_baseline=True, batch_size=1)
+      f1_score = results['f1'][0]
+      mo["BERTScore"] = float(f1_score)
       yield mo
 
   def predict_with_metadata(self, indexed_inputs):
@@ -757,7 +754,7 @@ class SafeTextGenerationWrapper(lit_model.ModelWrapper):
   def input_spec(self):
     input_spec = {
         "input_text": lit_types.TextSegment(),
-        "target_text": lit_types.ReferenceTexts(),
+        "target_text": lit_types.TextSegment(),
     }
     return lit_types.remap_spec(input_spec, self.FIELD_RENAMES)
 
