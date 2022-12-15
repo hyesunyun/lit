@@ -114,12 +114,12 @@ def main(argv: Sequence[str]) -> Optional[dev_server.LitServerType]:
   if "decision" in _TASKS.value:
     for k, m in base_models.items():
       models[k + "_decision"] = pretrained_lms.SafeTextDecisionWrapper(m)
-    datasets["safe-text-decision"] = lm.SafeTextDecisionData("/home/yun.hy/lit/lit_nlp/examples/datasets/SafeText/safetext_for_decision.csv")
+    datasets["safe-text-decision"] = lm.SafeTextDecisionData("/home/yun.hy/lit/lit_nlp/examples/datasets/safetext/safetext_for_decision.csv")
 
   if "generation" in _TASKS.value:
     for k, m in base_models.items():
       models[k + "_generation"] = pretrained_lms.SafeTextGenerationWrapper(m)
-    datasets["safe-text-gen"] = lm.SafeTextGenerationData("/home/yun.hy/lit/lit_nlp/examples/datasets/SafeText/safetext_for_generation.csv")
+    datasets["safe-text-gen"] = lm.SafeTextGenerationData("/home/yun.hy/lit/lit_nlp/examples/datasets/safetext/safetext_for_generation.csv")
 
   for name in datasets:
     logging.info("Dataset: '%s' with %d examples", name, len(datasets[name]))
