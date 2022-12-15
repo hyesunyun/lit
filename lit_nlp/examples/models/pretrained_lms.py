@@ -54,7 +54,7 @@ def masked_token_mean_torch(vectors, masks):
     <torch.float32>[batch_size, emb_dim]
   """
   masks = masks.type(torch.FloatTensor)
-  weights = masks / torch.sum(masks, axis=1)
+  weights = masks / torch.sum(masks, axis=1, keepdim=True)
   return torch.sum(vectors * torch.unsqueeze(weights, -1), axis=1)
 
 class BertMLM(lit_model.Model):
@@ -254,7 +254,7 @@ class GPT2LanguageModel(lit_model.Model):
     # hidden_states is <float>[batch_size, num_tokens, emb_dim]
     # take the mean over real tokens to get <float>[batch_size, emb_dim]
     batched_outputs["decoder_final_embedding"] = masked_token_mean_tf(
-        results.hidden_states[0], encoded_inputs["attention_mask"])
+        results.hidden_states[24], encoded_inputs["attention_mask"])
 
     if self.config.output_attention:
       for i in range(len(results.attentions)):
@@ -390,7 +390,7 @@ class GPT2LanguageModel(lit_model.Model):
       # Add attention for each layer.
       for i in range(self.num_layers):
         spec[f"decoder_layer_{i+1:d}_attention"] = lit_types.AttentionHeads(
-            align_in="input_tokens", align_out="input_tokens")
+            align_in="target_tokens", align_out="target_tokens")
     return spec
 
 
@@ -428,9 +428,10 @@ class BioGPTLanguageModel(lit_model.Model):
     """
     super().__init__()
     self.config = BioGPTLanguageModelConfig(**config_kw)
+    assert self.config.num_to_generate <= self.config.beam_size
     # GPT2-medium/BioGPT is trained without pad_token, so pick arbitrary one and mask out.
     self.tokenizer = transformers.AutoTokenizer.from_pretrained(
-        model_name, pad_token="<|endoftext|>", use_fast=False)
+        model_name, use_fast=False)
     self.model = transformers.BioGptForCausalLM.from_pretrained(
         model_name, output_hidden_states=True, output_attentions=True)
 
@@ -485,7 +486,7 @@ class BioGPTLanguageModel(lit_model.Model):
     # hidden_states is <float>[batch_size, num_tokens, emb_dim]
     # take the mean over real tokens to get <float>[batch_size, emb_dim]
     batched_outputs["decoder_final_embedding"] = masked_token_mean_torch(
-        results.hidden_states[0], encoded_inputs["attention_mask"])
+        results.hidden_states[24], encoded_inputs["attention_mask"])
 
     if self.config.output_attention:
       for i in range(len(results.attentions)):
@@ -622,7 +623,7 @@ class BioGPTLanguageModel(lit_model.Model):
       # Add attention for each layer.
       for i in range(self.num_layers):
         spec[f"decoder_layer_{i+1:d}_attention"] = lit_types.AttentionHeads(
-            align_in="input_tokens", align_out="input_tokens")
+            align_in="target_tokens", align_out="target_tokens")
     return spec
 
 class SafeTextDecisionWrapper(lit_model.ModelWrapper):
